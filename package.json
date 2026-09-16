@@ -1,0 +1,13 @@
+{
+  "name": "ping-slack-bot",
+  "version": "1.0.0",
+  "description": "Slack bot to trigger Ping Login Playwright tests from a channel",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.17.0",
+    "dotenv": "^16.4.0"
+  }
+}
