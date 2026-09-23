@@ -6,7 +6,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// Registry maps numeric string ID → { relPath, title }
+// Registry maps numeric string ID → { relPath, title?, titles?, describe, isSerial }
 // Rebuilt each time discoverTests() is called (i.e. each /playwright invocation).
 const testRegistry = new Map();
 let testIdCounter = 0;
@@ -14,9 +14,36 @@ let testIdCounter = 0;
 const TEST_PROJECT_DIR = process.env.TEST_PROJECT_DIR;
 const TEST_SPEC_DIR   = process.env.TEST_SPEC_DIR;
 
-// ── Active runs map: runId → { proc, channelId, userId, client } ──────────────
+// ── Active runs map: runId → { proc, channelId, userId, msgTs, runningText, testKeys } ──
 const activeRuns = new Map();
 let runCounter = 0;
+
+function getTestKeys(selectedTests) {
+  const keys = new Set();
+  for (const t of selectedTests) {
+    if (t.relPaths) {
+      for (const { relPath, title } of t.relPaths) keys.add(`${relPath}::${title}`);
+    } else if (t.isSerial) {
+      for (const title of t.titles) keys.add(`${t.relPath}::${title}`);
+    } else {
+      keys.add(`${t.relPath}::${t.title}`);
+    }
+  }
+  return keys;
+}
+
+// ── Test groups (loaded from test-groups.json on each /playwright invocation) ──
+let currentTestGroups = {};
+
+function loadTestGroups() {
+  const filePath = path.join(TEST_SPEC_DIR, 'test-groups.json');
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (_) {
+    return {};
+  }
+}
 
 // ── Slack app ─────────────────────────────────────────────────────────────────
 
@@ -33,9 +60,10 @@ app.command('/playwright', async ({ command, ack, client, logger }) => {
 
   try {
     const groups = discoverTests(TEST_SPEC_DIR);
+    currentTestGroups = loadTestGroups();
     await client.views.open({
       trigger_id: command.trigger_id,
-      view: buildModal(groups, command.channel_id),
+      view: buildModal(groups, command.channel_id, currentTestGroups),
     });
   } catch (err) {
     logger.error(err);
@@ -75,13 +103,34 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
 
   const channelId = view.private_metadata;
   const userId = body.user.id;
-  const selectedTests = extractSelected(view);
+  const selectedTests = extractSelected(view, currentTestGroups);
 
   if (!selectedTests.length) return;
 
+  const incomingKeys = getTestKeys(selectedTests);
+  for (const run of activeRuns.values()) {
+    const overlap = [...incomingKeys].filter(k => run.testKeys.has(k));
+    if (overlap.length > 0) {
+      await client.chat.postMessage({
+        channel: channelId,
+        text: `<@${userId}> ⏳ Some of those tests are already running by <@${run.userId}>. Please wait for them to finish.`,
+      });
+      return;
+    }
+  }
+
+  const prodChecked = (view.state.values['env_select']?.['env']?.selected_options || []).some(o => o.value === 'vuhl-prod-chrome');
+  const project = prodChecked ? 'vuhl-prod-chrome' : 'vuhl-uat-chrome';
+  const envLabel = project === 'vuhl-prod-chrome' ? 'Prod' : 'UAT';
+
   const runId = String(++runCounter);
   const testList = buildGroupedList(selectedTests);
-  const runningText = `🔄 <@${userId}> is running ${selectedTests.length} test${selectedTests.length !== 1 ? 's' : ''}:\n\n${testList}`;
+  const totalTests = selectedTests.reduce((sum, t) => {
+    if (t.relPaths) return sum + t.relPaths.length;
+    if (t.isSerial) return sum + t.titles.length;
+    return sum + 1;
+  }, 0);
+  const runningText = `🔄 <@${userId}> is running ${totalTests} test${totalTests !== 1 ? 's' : ''} on *${envLabel}*:\n\n${testList}`;
 
   // Post "running" message with Stop button
   let runMsg;
@@ -116,9 +165,9 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
   // Execute tests
   const startTime = Date.now();
   try {
-    const { proc, promise } = runPlaywrightTests(selectedTests);
+    const { proc, promise } = runPlaywrightTests(selectedTests, project);
 
-    activeRuns.set(runId, { proc, channelId, userId, msgTs: runMsg.ts, runningText });
+    activeRuns.set(runId, { proc, channelId, userId, msgTs: runMsg.ts, runningText, testKeys: incomingKeys });
 
     const { results } = await promise;
     activeRuns.delete(runId);
@@ -135,7 +184,7 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
 
     await client.chat.postMessage({
       channel: channelId,
-      text: `<@${userId}>\n${formatResults(results, elapsed)}`,
+      text: `<@${userId}>\n${formatResults(results, elapsed, envLabel)}`,
     });
   } catch (err) {
     activeRuns.delete(runId);
@@ -164,22 +213,52 @@ function discoverTests(specDir) {
   const testDir = path.join(specDir, 'tests');
   const files = findSpecFiles(testDir).sort();
 
-  return files.map(file => {
+  return files.flatMap(file => {
     const fullPath = path.join(testDir, file);
-    // Relative to TEST_PROJECT_DIR so it works as a playwright file arg
     const relPath = path.relative(TEST_PROJECT_DIR, fullPath).replace(/\\/g, '/');
     const content = fs.readFileSync(fullPath, 'utf8');
-    const descMatch = content.match(/test\.describe(?:\.\w+)?\(\s*['"`]([^'"`]+)['"`]/);
-    const testRegex = /^\s*test\(\s*['"`]([^'"`]+)['"`]/gm;
-    const tests = [];
+
+    // Find all describe blocks (serial or regular) with their byte positions
+    const describeRegex = /test\.describe(\.serial)?\s*\(\s*['"`]([^'"`]+)['"`]/g;
+    const describes = [];
     let m;
-    const describeName = descMatch ? descMatch[1] : file;
-    while ((m = testRegex.exec(content)) !== null) {
-      const id = String(testIdCounter++);
-      testRegistry.set(id, { relPath, title: m[1], describe: describeName });
-      tests.push({ id, title: m[1] });
+    while ((m = describeRegex.exec(content)) !== null) {
+      describes.push({ isSerial: !!m[1], name: m[2].replace(/^(\w+):\s*(?=\1)/i, ''), pos: m.index, tests: [] });
     }
-    return { file, describe: describeName, tests };
+
+    // Fallback: no describe block found — treat whole file as one non-serial group
+    if (describes.length === 0) {
+      describes.push({ isSerial: false, name: file, pos: 0, tests: [] });
+    }
+
+    // Assign each test() call to the nearest preceding describe block
+    const testRegex = /^\s*test\s*\(\s*['"`]([^'"`]+)['"`]/gm;
+    while ((m = testRegex.exec(content)) !== null) {
+      let parent = null;
+      for (const d of describes) {
+        if (d.pos <= m.index && (!parent || d.pos > parent.pos)) parent = d;
+      }
+      if (parent) parent.tests.push(m[1]);
+    }
+
+    return describes
+      .filter(d => d.tests.length > 0)
+      .map(d => {
+        if (d.isSerial) {
+          // One registry entry for the whole group — runs as a unit
+          const id = String(testIdCounter++);
+          testRegistry.set(id, { relPath, titles: d.tests, describe: d.name, isSerial: true });
+          return { file, describe: d.name, isSerial: true, id, tests: d.tests };
+        } else {
+          // One registry entry per individual test
+          const tests = d.tests.map(title => {
+            const id = String(testIdCounter++);
+            testRegistry.set(id, { relPath, title, describe: d.name, isSerial: false });
+            return { id, title };
+          });
+          return { file, describe: d.name, isSerial: false, tests };
+        }
+      });
   });
 }
 
@@ -198,35 +277,124 @@ function findSpecFiles(dir, base = '') {
 
 // ── Slack modal builder ───────────────────────────────────────────────────────
 
-function buildModal(groups, channelId) {
-  const blocks = [];
+function buildModal(groups, channelId, testGroups = {}) {
+  const blocks = [
+    {
+      type: 'actions',
+      block_id: 'env_select',
+      elements: [
+        {
+          type: 'checkboxes',
+          action_id: 'env',
+          options: [
+            { text: { type: 'mrkdwn', text: 'Run against *Prod* (unchecked = UAT)' }, value: 'vuhl-prod-chrome' },
+          ],
+        },
+      ],
+    },
+    { type: 'divider' },
+  ];
+
+  // Predefined groups (e.g. Regression) from test-groups.json
+  const groupNames = Object.keys(testGroups);
+  if (groupNames.length > 0) {
+    for (const groupName of groupNames) {
+      const tests = testGroups[groupName] || [];
+      blocks.push({
+        type: 'actions',
+        block_id: `group_${groupName}`,
+        elements: [{
+          type: 'checkboxes',
+          action_id: 'chk',
+          options: [{
+            text: { type: 'mrkdwn', text: `*${groupName}* _(${tests.length} tests, runs serially)_`.substring(0, 150) },
+            value: `group::${groupName}`,
+          }],
+        }],
+      });
+      blocks.push({
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: tests.map(t => `• ${t.description || t.test}`).join('\n').substring(0, 3000),
+        }],
+      });
+    }
+    blocks.push({ type: 'divider' });
+  }
+
   let blockCounter = 0;
 
   // Slack modal limit is 100 blocks; each group = 2 blocks (header + checkboxes)
-  const MAX_GROUPS = 49;
+  // blocks used above vary by groups count, so cap individual tests conservatively
+  const MAX_GROUPS = 48 - groupNames.length;
   const visible = groups.slice(0, MAX_GROUPS);
   const hidden = groups.length - visible.length;
 
   for (const group of visible) {
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: `*${group.describe}*` },
-    });
-
-    blocks.push({
-      type: 'actions',
-      block_id: `blk_${blockCounter++}`,
-      elements: [
-        {
-          type: 'checkboxes',
-          action_id: 'chk',
-          options: group.tests.map(({ id, title }) => ({
-            text: { type: 'mrkdwn', text: title.substring(0, 150) },
-            value: id, // numeric ID — registry lookup prevents cross-file title collisions
-          })),
-        },
-      ],
-    });
+    if (group.isSerial) {
+      blocks.push({
+        type: 'actions',
+        block_id: `blk_${blockCounter++}`,
+        elements: [
+          {
+            type: 'checkboxes',
+            action_id: 'chk',
+            options: [
+              {
+                text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) },
+                value: group.id,
+              },
+            ],
+          },
+        ],
+      });
+      blocks.push({
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: group.tests.map(t => `• ${t}`).join('\n').substring(0, 3000),
+          },
+        ],
+      });
+    } else if (group.tests.length === 1) {
+      blocks.push({
+        type: 'actions',
+        block_id: `blk_${blockCounter++}`,
+        elements: [
+          {
+            type: 'checkboxes',
+            action_id: 'chk',
+            options: [
+              {
+                text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) },
+                value: group.tests[0].id,
+              },
+            ],
+          },
+        ],
+      });
+    } else {
+      blocks.push({
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `*${group.describe}*` }],
+      });
+      blocks.push({
+        type: 'actions',
+        block_id: `blk_${blockCounter++}`,
+        elements: [
+          {
+            type: 'checkboxes',
+            action_id: 'chk',
+            options: group.tests.map(({ id, title }) => ({
+              text: { type: 'mrkdwn', text: title.substring(0, 150) },
+              value: id,
+            })),
+          },
+        ],
+      });
+    }
   }
 
   if (hidden > 0) {
@@ -249,14 +417,29 @@ function buildModal(groups, channelId) {
 
 // ── Extract selected tests from modal submission ───────────────────────────────
 
-// Returns [{ relPath, title }] — looked up by ID so titles are scoped to their file.
-function extractSelected(view) {
+function extractSelected(view, testGroups = {}) {
   const selected = [];
   for (const blockValues of Object.values(view.state.values)) {
     for (const actionValue of Object.values(blockValues)) {
       for (const opt of (actionValue.selected_options || [])) {
-        const entry = testRegistry.get(opt.value);
-        if (entry) selected.push(entry);
+        if (opt.value.startsWith('group::')) {
+          const groupName = opt.value.slice(7);
+          const entries = testGroups[groupName] || [];
+          if (entries.length > 0) {
+            selected.push({
+              isGroup: true,
+              describe: groupName,
+              relPaths: entries.map(e => ({
+                relPath: e.file.replace(/\\/g, '/'),
+                title: e.test,
+                display: e.description || e.test,
+              })),
+            });
+          }
+        } else {
+          const entry = testRegistry.get(opt.value);
+          if (entry) selected.push(entry);
+        }
       }
     }
   }
@@ -267,12 +450,22 @@ function extractSelected(view) {
 
 // Runs each file's tests in its own process so same-named tests in different
 // files don't bleed into each other.  Returns the same { proc, promise } shape.
-function runPlaywrightTests(tests) {
-  // Group by file path
+function runPlaywrightTests(tests, project = 'vuhl-uat-chrome') {
+  // Group by file path; serial and group entries expand all their titles
   const byFile = new Map();
-  for (const { relPath, title } of tests) {
-    if (!byFile.has(relPath)) byFile.set(relPath, []);
-    byFile.get(relPath).push(title);
+  for (const entry of tests) {
+    if (entry.relPaths) {
+      for (const { relPath, title } of entry.relPaths) {
+        if (!byFile.has(relPath)) byFile.set(relPath, []);
+        byFile.get(relPath).push(title);
+      }
+    } else if (entry.isSerial) {
+      if (!byFile.has(entry.relPath)) byFile.set(entry.relPath, []);
+      byFile.get(entry.relPath).push(...entry.titles);
+    } else {
+      if (!byFile.has(entry.relPath)) byFile.set(entry.relPath, []);
+      byFile.get(entry.relPath).push(entry.title);
+    }
   }
 
   let currentProc = null;
@@ -290,7 +483,7 @@ function runPlaywrightTests(tests) {
     const allResults = [];
     for (const [relPath, titles] of byFile.entries()) {
       if (stopped) break;
-      const { proc: fileProc, promise: fp } = spawnFileTests(relPath, titles);
+      const { proc: fileProc, promise: fp } = spawnFileTests(relPath, titles, project);
       currentProc = fileProc;
       const { results } = await fp;
       allResults.push(...results);
@@ -301,7 +494,7 @@ function runPlaywrightTests(tests) {
   return { proc, promise };
 }
 
-function spawnFileTests(relPath, titles) {
+function spawnFileTests(relPath, titles, project = 'vuhl-uat-chrome') {
   const grepPattern = titles
     .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
     .join('|');
@@ -310,8 +503,10 @@ function spawnFileTests(relPath, titles) {
 
   const proc = spawn('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-Command',
-    `npx playwright test '${pathEscaped}' '--grep=${grepEscaped}' '--reporter=json' --workers=1 --project=vuhl-uat-chrome`,
+    `npx playwright test '${pathEscaped}' '--grep=${grepEscaped}' '--reporter=json' --workers=1 --project=${project}`,
   ], { cwd: TEST_PROJECT_DIR, shell: false });
+
+  const TIMEOUT_MS = 10 * 60 * 1000;
 
   const promise = new Promise((resolve, reject) => {
     let stdout = '';
@@ -320,7 +515,13 @@ function spawnFileTests(relPath, titles) {
     proc.stderr.on('data', d => { stderr += d.toString(); });
     proc.on('error', err => { console.error('[SPAWN ERROR]', err.message); reject(err); });
 
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`Test timed out after 10 minutes: ${relPath}`));
+    }, TIMEOUT_MS);
+
     proc.on('close', (code, signal) => {
+      clearTimeout(timer);
       if (signal) {
         reject(new Error(`Process killed (${signal})`));
         return;
@@ -364,11 +565,17 @@ function buildGroupedList(tests) {
   const groups = new Map();
   for (const t of tests) {
     const key = t.describe || '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(t.title);
+    if (!groups.has(key)) groups.set(key, { isSerial: t.isSerial || false, titles: [] });
+    if (t.relPaths) {
+      groups.get(key).titles.push(...t.relPaths.map(r => r.display || r.title));
+    } else if (t.isSerial) {
+      groups.get(key).titles.push(...t.titles);
+    } else {
+      groups.get(key).titles.push(t.title);
+    }
   }
   const lines = [];
-  for (const [describe, titles] of groups.entries()) {
+  for (const [describe, { titles }] of groups.entries()) {
     if (describe) lines.push(`*${describe}*`);
     for (const title of titles) lines.push(`• ${title}`);
   }
@@ -377,12 +584,12 @@ function buildGroupedList(tests) {
 
 // ── Format results for Slack ──────────────────────────────────────────────────
 
-function formatResults(results, elapsedMs) {
+function formatResults(results, elapsedMs, envLabel = 'UAT') {
   const passed = results.filter(r => r.status === 'passed').length;
   const failed = results.length - passed;
   const sec = (elapsedMs / 1000).toFixed(1);
 
-  let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s\n\n`;
+  let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s · *${envLabel}*\n\n`;
 
   // Group by describe block, preserving order of first appearance
   const groups = new Map();
