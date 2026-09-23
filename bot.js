@@ -11,8 +11,8 @@ const path = require('path');
 const testRegistry = new Map();
 let testIdCounter = 0;
 
-const TEST_PROJECT_DIR = 'C:\\myWork\\Playwright\\myvu-front-end';           // where playwright.config.ts lives (cwd for npx playwright)
-const TEST_SPEC_DIR   = 'C:\\myWork\\Playwright\\myvu-front-end\\playwright-tests'; // where spec files are discovered
+const TEST_PROJECT_DIR = process.env.TEST_PROJECT_DIR;
+const TEST_SPEC_DIR   = process.env.TEST_SPEC_DIR;
 
 // ── Active runs map: runId → { proc, channelId, userId, client } ──────────────
 const activeRuns = new Map();
