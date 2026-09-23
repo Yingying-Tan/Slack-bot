@@ -6,6 +6,11 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+// Registry maps numeric string ID → { relPath, title }
+// Rebuilt each time discoverTests() is called (i.e. each /playwright invocation).
+const testRegistry = new Map();
+let testIdCounter = 0;
+
 const TEST_PROJECT_DIR = 'C:\\myWork\\Playwright\\myvu-front-end';           // where playwright.config.ts lives (cwd for npx playwright)
 const TEST_SPEC_DIR   = 'C:\\myWork\\Playwright\\myvu-front-end\\playwright-tests'; // where spec files are discovered
 
@@ -75,8 +80,8 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
   if (!selectedTests.length) return;
 
   const runId = String(++runCounter);
-  const testList = selectedTests.map(t => `• ${t}`).join('\n');
-  const runningText = `🔄 <@${userId}> is running ${selectedTests.length} test${selectedTests.length !== 1 ? 's' : ''}:\n${testList}`;
+  const testList = buildGroupedList(selectedTests);
+  const runningText = `🔄 <@${userId}> is running ${selectedTests.length} test${selectedTests.length !== 1 ? 's' : ''}:\n\n${testList}`;
 
   // Post "running" message with Stop button
   let runMsg;
@@ -153,18 +158,28 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
 // ── Test discovery ────────────────────────────────────────────────────────────
 
 function discoverTests(specDir) {
+  testRegistry.clear();
+  testIdCounter = 0;
+
   const testDir = path.join(specDir, 'tests');
   const files = findSpecFiles(testDir).sort();
 
   return files.map(file => {
     const fullPath = path.join(testDir, file);
+    // Relative to TEST_PROJECT_DIR so it works as a playwright file arg
+    const relPath = path.relative(TEST_PROJECT_DIR, fullPath).replace(/\\/g, '/');
     const content = fs.readFileSync(fullPath, 'utf8');
     const descMatch = content.match(/test\.describe(?:\.\w+)?\(\s*['"`]([^'"`]+)['"`]/);
     const testRegex = /^\s*test\(\s*['"`]([^'"`]+)['"`]/gm;
     const tests = [];
     let m;
-    while ((m = testRegex.exec(content)) !== null) tests.push(m[1]);
-    return { file, describe: descMatch ? descMatch[1] : file, tests };
+    const describeName = descMatch ? descMatch[1] : file;
+    while ((m = testRegex.exec(content)) !== null) {
+      const id = String(testIdCounter++);
+      testRegistry.set(id, { relPath, title: m[1], describe: describeName });
+      tests.push({ id, title: m[1] });
+    }
+    return { file, describe: describeName, tests };
   });
 }
 
@@ -205,9 +220,9 @@ function buildModal(groups, channelId) {
         {
           type: 'checkboxes',
           action_id: 'chk',
-          options: group.tests.map(title => ({
+          options: group.tests.map(({ id, title }) => ({
             text: { type: 'mrkdwn', text: title.substring(0, 150) },
-            value: title.substring(0, 150),
+            value: id, // numeric ID — registry lookup prevents cross-file title collisions
           })),
         },
       ],
@@ -234,12 +249,14 @@ function buildModal(groups, channelId) {
 
 // ── Extract selected tests from modal submission ───────────────────────────────
 
+// Returns [{ relPath, title }] — looked up by ID so titles are scoped to their file.
 function extractSelected(view) {
   const selected = [];
   for (const blockValues of Object.values(view.state.values)) {
     for (const actionValue of Object.values(blockValues)) {
       for (const opt of (actionValue.selected_options || [])) {
-        selected.push(opt.value);
+        const entry = testRegistry.get(opt.value);
+        if (entry) selected.push(entry);
       }
     }
   }
@@ -248,15 +265,52 @@ function extractSelected(view) {
 
 // ── Playwright execution ──────────────────────────────────────────────────────
 
+// Runs each file's tests in its own process so same-named tests in different
+// files don't bleed into each other.  Returns the same { proc, promise } shape.
 function runPlaywrightTests(tests) {
-  const grepPattern = tests
+  // Group by file path
+  const byFile = new Map();
+  for (const { relPath, title } of tests) {
+    if (!byFile.has(relPath)) byFile.set(relPath, []);
+    byFile.get(relPath).push(title);
+  }
+
+  let currentProc = null;
+  let stopped = false;
+
+  // Proxy so the stop button can kill whichever process is currently running
+  const proc = {
+    kill(sig) {
+      stopped = true;
+      currentProc?.kill(sig);
+    },
+  };
+
+  const promise = (async () => {
+    const allResults = [];
+    for (const [relPath, titles] of byFile.entries()) {
+      if (stopped) break;
+      const { proc: fileProc, promise: fp } = spawnFileTests(relPath, titles);
+      currentProc = fileProc;
+      const { results } = await fp;
+      allResults.push(...results);
+    }
+    return { results: allResults };
+  })();
+
+  return { proc, promise };
+}
+
+function spawnFileTests(relPath, titles) {
+  const grepPattern = titles
     .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
     .join('|');
   const grepEscaped = grepPattern.replace(/'/g, "''");
+  const pathEscaped = relPath.replace(/'/g, "''");
 
   const proc = spawn('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-Command',
-    `npx playwright test '--grep=${grepEscaped}' '--reporter=json' --workers=1 --project=vuhl-uat-chrome`,
+    `npx playwright test '${pathEscaped}' '--grep=${grepEscaped}' '--reporter=json' --workers=1 --project=vuhl-uat-chrome`,
   ], { cwd: TEST_PROJECT_DIR, shell: false });
 
   const promise = new Promise((resolve, reject) => {
@@ -291,6 +345,7 @@ function parsePlaywrightJson(json) {
         const r = spec.tests?.[0]?.results?.[0];
         results.push({
           title: spec.title,
+          describe: suite.title, // the suite that directly contains the spec is the describe block
           status: r?.status || (spec.ok ? 'passed' : 'failed'),
           duration: r?.duration || 0,
           error: r?.errors?.[0]?.message || null,
@@ -303,6 +358,23 @@ function parsePlaywrightJson(json) {
   return results;
 }
 
+// ── Shared grouping helper ────────────────────────────────────────────────────
+
+function buildGroupedList(tests) {
+  const groups = new Map();
+  for (const t of tests) {
+    const key = t.describe || '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t.title);
+  }
+  const lines = [];
+  for (const [describe, titles] of groups.entries()) {
+    if (describe) lines.push(`*${describe}*`);
+    for (const title of titles) lines.push(`• ${title}`);
+  }
+  return lines.join('\n');
+}
+
 // ── Format results for Slack ──────────────────────────────────────────────────
 
 function formatResults(results, elapsedMs) {
@@ -310,19 +382,31 @@ function formatResults(results, elapsedMs) {
   const failed = results.length - passed;
   const sec = (elapsedMs / 1000).toFixed(1);
 
-  let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s\n`;
+  let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s\n\n`;
 
+  // Group by describe block, preserving order of first appearance
+  const groups = new Map();
   for (const r of results) {
-    const icon = r.status === 'passed' ? '✅' : '❌';
-    const dur = (r.duration / 1000).toFixed(1);
-    text += `${icon}  ${r.title} _(${dur}s)_\n`;
-    if (r.error) {
-      const firstLine = r.error.split('\n')[0].substring(0, 120);
-      text += `      \`${firstLine}\`\n`;
-    }
+    const key = r.describe || '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
   }
 
-  text += `\n*${passed} passed · ${failed} failed*`;
+  for (const [describe, groupResults] of groups.entries()) {
+    if (describe) text += `*${describe}*\n`;
+    for (const r of groupResults) {
+      const icon = r.status === 'passed' ? '✅' : '❌';
+      const dur = (r.duration / 1000).toFixed(1);
+      text += `${icon}  ${r.title} _(${dur}s)_\n`;
+      if (r.error) {
+        const firstLine = r.error.split('\n')[0].substring(0, 120);
+        text += `      \`${firstLine}\`\n`;
+      }
+    }
+    text += '\n';
+  }
+
+  text += `*${passed} passed · ${failed} failed*`;
   return text;
 }
 
