@@ -77,24 +77,85 @@ Listening for /playwright command...
 
 ---
 
-## Slack App Configuration
+## Creating a Slack App
 
-If you're setting up your own Slack app, you'll need:
+Follow these steps to create and configure a Slack app that works with this bot.
 
-**OAuth Scopes (Bot Token)**
-- `chat:write` — post messages
-- `commands` — receive slash commands
+### 1. Create the app
 
-**Slash Command**
-- Command: `/playwright`
-- Request URL: *(not needed — uses Socket Mode)*
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
+2. Choose **From scratch**
+3. Enter an app name (e.g. `Playwright Test Runner`) and select your workspace
+4. Click **Create App**
 
-**Socket Mode**
-- Enable Socket Mode in your app settings
-- Generate an App-Level Token with the `connections:write` scope
+---
 
-**Event Subscriptions**
-- Enable and subscribe to `app_mention` (optional, for future use)
+### 2. Enable Socket Mode
+
+Socket Mode lets the bot connect without a public URL — required for this bot.
+
+1. In the left sidebar, go to **Socket Mode**
+2. Toggle **Enable Socket Mode** on
+3. You'll be prompted to create an **App-Level Token**:
+   - Name it anything (e.g. `socket-token`)
+   - Add the scope: `connections:write`
+   - Click **Generate**
+4. Copy the token — it starts with `xapp-` — and paste it as `SLACK_APP_TOKEN` in your `.env`
+
+---
+
+### 3. Add OAuth scopes
+
+1. In the left sidebar, go to **OAuth & Permissions**
+2. Scroll down to **Scopes → Bot Token Scopes**
+3. Click **Add an OAuth Scope** and add both:
+   - `chat:write` — so the bot can post messages and results
+   - `commands` — so the bot can receive the `/playwright` slash command
+
+---
+
+### 4. Create the slash command
+
+1. In the left sidebar, go to **Slash Commands**
+2. Click **Create New Command**
+3. Fill in:
+   - **Command**: `/playwright`
+   - **Request URL**: enter any placeholder URL (e.g. `https://example.com`) — Socket Mode ignores this
+   - **Short Description**: `Run Playwright tests`
+4. Click **Save**
+
+---
+
+### 5. Enable Interactivity
+
+The bot uses a modal with checkboxes and a Stop button — these require Interactivity to be on.
+
+1. In the left sidebar, go to **Interactivity & Shortcuts**
+2. Toggle **Interactivity** on
+3. Enter any placeholder URL (e.g. `https://example.com`) in the Request URL field — Socket Mode ignores this
+4. Click **Save Changes**
+
+---
+
+### 6. Install the app to your workspace
+
+1. In the left sidebar, go to **OAuth & Permissions**
+2. Click **Install to Workspace** (or **Reinstall** if you've done this before)
+3. Review the permissions and click **Allow**
+4. Copy the **Bot User OAuth Token** — it starts with `xoxb-` — and paste it as `SLACK_BOT_TOKEN` in your `.env`
+
+---
+
+### 7. Invite the bot to a channel
+
+The bot can only post in channels it has been invited to.
+
+In Slack, open the channel you want to use and type:
+```
+/invite @YourBotName
+```
+
+Then type `/playwright` to open the test selection modal.
 
 ---
 
