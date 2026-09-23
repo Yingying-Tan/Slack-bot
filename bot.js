@@ -419,6 +419,6 @@ function formatResults(results, elapsedMs) {
   });
 
   await app.start();
-  console.log('Ping Test Bot is running (Socket Mode)');
+  console.log('Slack Test Bot is running (Socket Mode)');
   console.log('Listening for /playwright command...');
 })();

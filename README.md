@@ -4,6 +4,8 @@ A Slack bot that lets your team trigger Playwright tests directly from a Slack c
 
 Type `/playwright` in any channel, pick tests from a modal, and get results posted back when they finish.
 
+> **Important:** This bot runs on whoever's local machine started it. When someone in Slack types `/playwright`, the tests run on **that person's machine** — not in the cloud or on GitHub. The bot must be actively running for the slash command to work. If the machine running the bot is shut down or the bot process is stopped, nobody in Slack will be able to trigger tests until it's started again.
+
 ---
 
 ## How it works
@@ -71,9 +73,11 @@ npm start
 
 You should see:
 ```
-Ping Test Bot is running (Socket Mode)
+Slack Test Bot is running (Socket Mode)
 Listening for /playwright command...
 ```
+
+> **Keep this running.** The bot process must stay open on your machine for anyone in Slack to use `/playwright`. Tests run on your local machine — if you close the terminal or shut down your computer, the bot goes offline and the slash command will stop working for everyone until you start it again.
 
 ---
 
