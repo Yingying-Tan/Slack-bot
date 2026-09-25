@@ -13,27 +13,26 @@ let testIdCounter = 0;
 
 const TEST_PROJECT_DIR = process.env.TEST_PROJECT_DIR;
 const TEST_SPEC_DIR   = process.env.TEST_SPEC_DIR;
+const RUN_TIMEOUT_MS  = 10 * 60 * 1000;
 
 // ── Active runs map: runId → { proc, channelId, userId, msgTs, runningText, testKeys } ──
 const activeRuns = new Map();
 let runCounter = 0;
 
-function getTestKeys(selectedTests) {
-  const keys = new Set();
-  for (const t of selectedTests) {
-    if (t.relPaths) {
-      for (const { relPath, title } of t.relPaths) keys.add(`${relPath}::${title}`);
-    } else if (t.isSerial) {
-      for (const title of t.titles) keys.add(`${t.relPath}::${title}`);
-    } else {
-      keys.add(`${t.relPath}::${t.title}`);
-    }
-  }
-  return keys;
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+// Expand any test entry to a flat list of { relPath, title } pairs.
+function expandEntry(entry) {
+  if (entry.relPaths) return entry.relPaths.map(({ relPath, title }) => ({ relPath, title }));
+  if (entry.isSerial) return entry.titles.map(title => ({ relPath: entry.relPath, title }));
+  return [{ relPath: entry.relPath, title: entry.title }];
 }
 
-// ── Test groups (loaded from test-groups.json on each /playwright invocation) ──
-let currentTestGroups = {};
+function getTestKeys(selectedTests) {
+  return new Set(
+    selectedTests.flatMap(expandEntry).map(({ relPath, title }) => `${relPath}::${title}`)
+  );
+}
 
 function loadTestGroups() {
   const filePath = path.join(TEST_SPEC_DIR, 'test-groups.json');
@@ -57,13 +56,12 @@ const app = new App({
 
 app.command('/playwright', async ({ command, ack, client, logger }) => {
   await ack();
-
   try {
     const groups = discoverTests(TEST_SPEC_DIR);
-    currentTestGroups = loadTestGroups();
+    const testGroups = loadTestGroups();
     await client.views.open({
       trigger_id: command.trigger_id,
-      view: buildModal(groups, command.channel_id, currentTestGroups),
+      view: buildModal(groups, command.channel_id, testGroups),
     });
   } catch (err) {
     logger.error(err);
@@ -74,7 +72,6 @@ app.command('/playwright', async ({ command, ack, client, logger }) => {
 
 app.action('stop_tests', async ({ ack, body, client }) => {
   await ack();
-
   const runId = body.actions[0].value;
   const run = activeRuns.get(runId);
   if (!run) return;
@@ -82,12 +79,8 @@ app.action('stop_tests', async ({ ack, body, client }) => {
   run.proc.kill('SIGTERM');
   activeRuns.delete(runId);
 
-  await client.chat.update({
-    channel: run.channelId,
-    ts: run.msgTs,
-    text: `<@${run.userId}> 🛑 Test run was stopped.\n\n${run.runningText}`,
-    blocks: [],
-  });
+  await updateMessage(client, run.channelId, run.msgTs,
+    `<@${run.userId}> 🛑 Test run was stopped.\n\n${run.testList}`);
 });
 
 // ── Modal submitted → run tests → post results ────────────────────────────────
@@ -97,14 +90,14 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
 
   const channelId = view.private_metadata;
   const userId = body.user.id;
-  const selectedTests = extractSelected(view, currentTestGroups);
+  const testGroups = loadTestGroups();
+  const selectedTests = extractSelected(view, testGroups);
 
   if (!selectedTests.length) return;
 
   const incomingKeys = getTestKeys(selectedTests);
   for (const run of activeRuns.values()) {
-    const overlap = [...incomingKeys].filter(k => run.testKeys.has(k));
-    if (overlap.length > 0) {
+    if ([...incomingKeys].some(k => run.testKeys.has(k))) {
       await client.chat.postMessage({
         channel: channelId,
         text: `<@${userId}> ⏳ Some of those tests are already running by <@${run.userId}>. Please wait for them to finish.`,
@@ -118,73 +111,64 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
   const envLabel = project === 'vuhl-prod-chrome' ? 'Prod' : 'UAT';
 
   const runId = String(++runCounter);
+  const totalTests = selectedTests.flatMap(expandEntry).length;
   const testList = buildGroupedList(selectedTests);
-  const totalTests = selectedTests.reduce((sum, t) => {
-    if (t.relPaths) return sum + t.relPaths.length;
-    if (t.isSerial) return sum + t.titles.length;
-    return sum + 1;
-  }, 0);
   const runningText = `🔄 <@${userId}> is running ${totalTests} test${totalTests !== 1 ? 's' : ''} on *${envLabel}*:\n\n${testList}`;
 
-  // Post "running" message with Stop button
   let runMsg;
   try {
-    runMsg = await client.chat.postMessage({
-      channel: channelId,
-      text: runningText,
-      blocks: [
-        {
-          type: 'section',
-          text: { type: 'mrkdwn', text: runningText },
-        },
-        {
-          type: 'actions',
-          elements: [
-            {
-              type: 'button',
-              text: { type: 'plain_text', text: '🛑 Stop' },
-              style: 'danger',
-              action_id: 'stop_tests',
-              value: runId,
-            },
-          ],
-        },
-      ],
-    });
+    runMsg = await postRunningMessage(client, channelId, runId, runningText);
   } catch (err) {
     logger.error('Failed to post running message:', err);
     return;
   }
 
-  // Execute tests
   const startTime = Date.now();
   try {
     const { proc, promise } = runPlaywrightTests(selectedTests, project);
-
-    activeRuns.set(runId, { proc, channelId, userId, msgTs: runMsg.ts, runningText, testKeys: incomingKeys });
+    activeRuns.set(runId, { proc, channelId, userId, msgTs: runMsg.ts, runningText, testList, testKeys: incomingKeys });
 
     const { results } = await promise;
     activeRuns.delete(runId);
 
-    const elapsed = Date.now() - startTime;
-
-    await client.chat.update({
-      channel: channelId,
-      ts: runMsg.ts,
-      text: `<@${userId}>\n${formatResults(results, elapsed, envLabel, selectedTests)}`,
-      blocks: [],
-    });
+    await updateMessage(client, channelId, runMsg.ts,
+      `<@${userId}>\n${formatResults(results, Date.now() - startTime, envLabel, selectedTests)}`);
   } catch (err) {
+    const stoppedManually = !activeRuns.has(runId);
     activeRuns.delete(runId);
-
-    await client.chat.update({
-      channel: channelId,
-      ts: runMsg.ts,
-      text: `<@${userId}> ❌ Test run failed\n\`\`\`${String(err.message).substring(0, 500)}\`\`\``,
-      blocks: [],
-    }).catch(() => {});
+    if (!stoppedManually) {
+      await updateMessage(client, channelId, runMsg.ts,
+        `<@${userId}> ❌ Test run failed\n\`\`\`${String(err.message).substring(0, 500)}\`\`\``
+      ).catch(() => {});
+    }
   }
 });
+
+// ── Slack message helpers ─────────────────────────────────────────────────────
+
+async function postRunningMessage(client, channelId, runId, text) {
+  return client.chat.postMessage({
+    channel: channelId,
+    text,
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text } },
+      {
+        type: 'actions',
+        elements: [{
+          type: 'button',
+          text: { type: 'plain_text', text: '🛑 Stop' },
+          style: 'danger',
+          action_id: 'stop_tests',
+          value: runId,
+        }],
+      },
+    ],
+  });
+}
+
+async function updateMessage(client, channelId, ts, text) {
+  return client.chat.update({ channel: channelId, ts, text, blocks: [] });
+}
 
 // ── Test discovery ────────────────────────────────────────────────────────────
 
@@ -200,7 +184,6 @@ function discoverTests(specDir) {
     const relPath = path.relative(TEST_PROJECT_DIR, fullPath).replace(/\\/g, '/');
     const content = fs.readFileSync(fullPath, 'utf8');
 
-    // Find all describe blocks (serial or regular) with their byte positions
     const describeRegex = /test\.describe(\.serial)?\s*\(\s*['"`]([^'"`]+)['"`]/g;
     const describes = [];
     let m;
@@ -208,12 +191,10 @@ function discoverTests(specDir) {
       describes.push({ isSerial: !!m[1], name: m[2].replace(/^(\w+):\s*(?=\1)/i, ''), pos: m.index, tests: [] });
     }
 
-    // Fallback: no describe block found — treat whole file as one non-serial group
     if (describes.length === 0) {
       describes.push({ isSerial: false, name: file, pos: 0, tests: [] });
     }
 
-    // Assign each test() call to the nearest preceding describe block
     const testRegex = /^\s*test\s*\(\s*['"`]([^'"`]+)['"`]/gm;
     while ((m = testRegex.exec(content)) !== null) {
       let parent = null;
@@ -227,12 +208,10 @@ function discoverTests(specDir) {
       .filter(d => d.tests.length > 0)
       .map(d => {
         if (d.isSerial) {
-          // One registry entry for the whole group — runs as a unit
           const id = String(testIdCounter++);
           testRegistry.set(id, { relPath, titles: d.tests, describe: d.name, isSerial: true });
           return { file, describe: d.name, isSerial: true, id, tests: d.tests };
         } else {
-          // One registry entry per individual test
           const tests = d.tests.map(title => {
             const id = String(testIdCounter++);
             testRegistry.set(id, { relPath, title, describe: d.name, isSerial: false });
@@ -260,123 +239,19 @@ function findSpecFiles(dir, base = '') {
 // ── Slack modal builder ───────────────────────────────────────────────────────
 
 function buildModal(groups, channelId, testGroups = {}) {
+  const groupNames = Object.keys(testGroups);
   const blocks = [
-    {
-      type: 'actions',
-      block_id: 'env_select',
-      elements: [
-        {
-          type: 'checkboxes',
-          action_id: 'env',
-          options: [
-            { text: { type: 'mrkdwn', text: 'Run against *Prod* (unchecked = UAT)' }, value: 'vuhl-prod-chrome' },
-          ],
-        },
-      ],
-    },
-    { type: 'divider' },
+    ...buildEnvBlock(),
+    ...buildPredefinedGroupBlocks(testGroups, groupNames),
   ];
 
-  // Predefined groups (e.g. Regression) from test-groups.json
-  const groupNames = Object.keys(testGroups);
-  if (groupNames.length > 0) {
-    for (const groupName of groupNames) {
-      const tests = testGroups[groupName] || [];
-      blocks.push({
-        type: 'actions',
-        block_id: `group_${groupName}`,
-        elements: [{
-          type: 'checkboxes',
-          action_id: 'chk',
-          options: [{
-            text: { type: 'mrkdwn', text: `*${groupName}* _(${tests.length} tests, runs serially)_`.substring(0, 150) },
-            value: `group::${groupName}`,
-          }],
-        }],
-      });
-      blocks.push({
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: tests.map(t => `• ${t.description || t.test}`).join('\n').substring(0, 3000),
-        }],
-      });
-    }
-    blocks.push({ type: 'divider' });
-  }
-
   let blockCounter = 0;
-
-  // Slack modal limit is 100 blocks; each group = 2 blocks (header + checkboxes)
-  // blocks used above vary by groups count, so cap individual tests conservatively
   const MAX_GROUPS = 48 - groupNames.length;
   const visible = groups.slice(0, MAX_GROUPS);
   const hidden = groups.length - visible.length;
 
   for (const group of visible) {
-    if (group.isSerial) {
-      blocks.push({
-        type: 'actions',
-        block_id: `blk_${blockCounter++}`,
-        elements: [
-          {
-            type: 'checkboxes',
-            action_id: 'chk',
-            options: [
-              {
-                text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) },
-                value: group.id,
-              },
-            ],
-          },
-        ],
-      });
-      blocks.push({
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: group.tests.map(t => `• ${t}`).join('\n').substring(0, 3000),
-          },
-        ],
-      });
-    } else if (group.tests.length === 1) {
-      blocks.push({
-        type: 'actions',
-        block_id: `blk_${blockCounter++}`,
-        elements: [
-          {
-            type: 'checkboxes',
-            action_id: 'chk',
-            options: [
-              {
-                text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) },
-                value: group.tests[0].id,
-              },
-            ],
-          },
-        ],
-      });
-    } else {
-      blocks.push({
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: `*${group.describe}*` }],
-      });
-      blocks.push({
-        type: 'actions',
-        block_id: `blk_${blockCounter++}`,
-        elements: [
-          {
-            type: 'checkboxes',
-            action_id: 'chk',
-            options: group.tests.map(({ id, title }) => ({
-              text: { type: 'mrkdwn', text: title.substring(0, 150) },
-              value: id,
-            })),
-          },
-        ],
-      });
-    }
+    blocks.push(...buildDiscoveredGroupBlock(group, blockCounter++));
   }
 
   if (hidden > 0) {
@@ -397,7 +272,104 @@ function buildModal(groups, channelId, testGroups = {}) {
   };
 }
 
-// ── Extract selected tests from modal submission ───────────────────────────────
+function buildEnvBlock() {
+  return [
+    {
+      type: 'actions',
+      block_id: 'env_select',
+      elements: [{
+        type: 'checkboxes',
+        action_id: 'env',
+        options: [{ text: { type: 'mrkdwn', text: 'Run against *Prod* (unchecked = UAT)' }, value: 'vuhl-prod-chrome' }],
+      }],
+    },
+    { type: 'divider' },
+  ];
+}
+
+function getGroupConfig(testGroups, groupName) {
+  const val = testGroups[groupName];
+  if (Array.isArray(val)) return { tests: val };
+  return { tests: val?.tests || [] };
+}
+
+function buildPredefinedGroupBlocks(testGroups, groupNames) {
+  if (groupNames.length === 0) return [];
+  const blocks = [];
+  for (const groupName of groupNames) {
+    const { tests } = getGroupConfig(testGroups, groupName);
+    const anyParallel = tests.some(t => t.parallel);
+    const allParallel = tests.length > 0 && tests.every(t => t.parallel);
+    const runLabel = allParallel ? 'runs in parallel' : anyParallel ? 'mixed parallelism' : 'runs serially';
+    blocks.push({
+      type: 'actions',
+      block_id: `group_${groupName}`,
+      elements: [{
+        type: 'checkboxes',
+        action_id: 'chk',
+        options: [{
+          text: { type: 'mrkdwn', text: `*${groupName}* _(${tests.length} tests, ${runLabel})_`.substring(0, 150) },
+          value: `group::${groupName}`,
+        }],
+      }],
+    });
+    blocks.push({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: tests.map(t => `• ${t.description || t.test}`).join('\n').substring(0, 3000) }],
+    });
+  }
+  blocks.push({ type: 'divider' });
+  return blocks;
+}
+
+function buildDiscoveredGroupBlock(group, counter) {
+  const blockId = `blk_${counter}`;
+  if (group.isSerial) {
+    return [
+      {
+        type: 'actions',
+        block_id: blockId,
+        elements: [{
+          type: 'checkboxes',
+          action_id: 'chk',
+          options: [{ text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) }, value: group.id }],
+        }],
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: group.tests.map(t => `• ${t}`).join('\n').substring(0, 3000) }],
+      },
+    ];
+  }
+  if (group.tests.length === 1) {
+    return [{
+      type: 'actions',
+      block_id: blockId,
+      elements: [{
+        type: 'checkboxes',
+        action_id: 'chk',
+        options: [{ text: { type: 'mrkdwn', text: `*${group.describe}*`.substring(0, 150) }, value: group.tests[0].id }],
+      }],
+    }];
+  }
+  return [
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `*${group.describe}*` }] },
+    {
+      type: 'actions',
+      block_id: blockId,
+      elements: [{
+        type: 'checkboxes',
+        action_id: 'chk',
+        options: group.tests.map(({ id, title }) => ({
+          text: { type: 'mrkdwn', text: title.substring(0, 150) },
+          value: id,
+        })),
+      }],
+    },
+  ];
+}
+
+// ── Extract selected tests from modal submission ──────────────────────────────
 
 function extractSelected(view, testGroups = {}) {
   const selected = [];
@@ -406,7 +378,7 @@ function extractSelected(view, testGroups = {}) {
       for (const opt of (actionValue.selected_options || [])) {
         if (opt.value.startsWith('group::')) {
           const groupName = opt.value.slice(7);
-          const entries = testGroups[groupName] || [];
+          const { tests: entries } = getGroupConfig(testGroups, groupName);
           if (entries.length > 0) {
             selected.push({
               isGroup: true,
@@ -415,6 +387,7 @@ function extractSelected(view, testGroups = {}) {
                 relPath: e.file.replace(/\\/g, '/'),
                 title: e.test,
                 display: e.description || e.test,
+                parallel: !!e.parallel,
               })),
             });
           }
@@ -431,45 +404,75 @@ function extractSelected(view, testGroups = {}) {
 // ── Playwright execution ──────────────────────────────────────────────────────
 
 // Runs each file's tests in its own process so same-named tests in different
-// files don't bleed into each other.  Returns the same { proc, promise } shape.
+// files don't bleed into each other.
+// For predefined groups: entries marked parallel:true all run concurrently;
+// the remaining serial entries run one by one. Both batches start at the same time.
 function runPlaywrightTests(tests, project = 'vuhl-uat-chrome') {
-  // Group by file path; serial and group entries expand all their titles
-  const byFile = new Map();
-  for (const entry of tests) {
-    if (entry.relPaths) {
-      for (const { relPath, title } of entry.relPaths) {
-        if (!byFile.has(relPath)) byFile.set(relPath, []);
-        byFile.get(relPath).push(title);
-      }
-    } else if (entry.isSerial) {
-      if (!byFile.has(entry.relPath)) byFile.set(entry.relPath, []);
-      byFile.get(entry.relPath).push(...entry.titles);
-    } else {
-      if (!byFile.has(entry.relPath)) byFile.set(entry.relPath, []);
-      byFile.get(entry.relPath).push(entry.title);
-    }
-  }
-
-  let currentProc = null;
+  const procs = new Set();
   let stopped = false;
 
-  // Proxy so the stop button can kill whichever process is currently running
   const proc = {
     kill(sig) {
       stopped = true;
-      currentProc?.kill(sig);
+      for (const p of procs) p.kill(sig);
     },
+  };
+
+  const spawnTracked = (relPath, titles) => {
+    const { proc: fileProc, promise: fp } = spawnFileTests(relPath, titles, project);
+    procs.add(fileProc);
+    return fp.finally(() => procs.delete(fileProc));
   };
 
   const promise = (async () => {
     const allResults = [];
-    for (const [relPath, titles] of byFile.entries()) {
+
+    for (const item of tests) {
       if (stopped) break;
-      const { proc: fileProc, promise: fp } = spawnFileTests(relPath, titles, project);
-      currentProc = fileProc;
-      const { results } = await fp;
-      allResults.push(...results);
+
+      if (item.relPaths) {
+        // Predefined group: split into serial and parallel batches, run both at once
+        const serialEntries = item.relPaths.filter(e => !e.parallel);
+        const parallelEntries = item.relPaths.filter(e => e.parallel);
+
+        const runSerialBatch = async () => {
+          const results = [];
+          for (const e of serialEntries) {
+            if (stopped) break;
+            const { results: r } = await spawnTracked(e.relPath, [e.title]);
+            results.push(...r);
+          }
+          return results;
+        };
+
+        const runParallelBatch = async () => {
+          const settled = await Promise.all(
+            parallelEntries.map(e => spawnTracked(e.relPath, [e.title]))
+          );
+          return settled.flatMap(r => r.results);
+        };
+
+        const [sResults, pResults] = await Promise.all([
+          serialEntries.length ? runSerialBatch() : Promise.resolve([]),
+          parallelEntries.length ? runParallelBatch() : Promise.resolve([]),
+        ]);
+        allResults.push(...sResults, ...pResults);
+
+      } else {
+        // Individual test from registry — run file by file sequentially
+        const byFile = new Map();
+        for (const { relPath, title } of expandEntry(item)) {
+          if (!byFile.has(relPath)) byFile.set(relPath, []);
+          byFile.get(relPath).push(title);
+        }
+        for (const [relPath, titles] of byFile.entries()) {
+          if (stopped) break;
+          const { results } = await spawnTracked(relPath, titles);
+          allResults.push(...results);
+        }
+      }
     }
+
     return { results: allResults };
   })();
 
@@ -488,8 +491,6 @@ function spawnFileTests(relPath, titles, project = 'vuhl-uat-chrome') {
     `npx playwright test '${pathEscaped}' '--grep=${grepEscaped}' '--reporter=json' --workers=1 --project=${project}`,
   ], { cwd: TEST_PROJECT_DIR, shell: false });
 
-  const TIMEOUT_MS = 10 * 60 * 1000;
-
   const promise = new Promise((resolve, reject) => {
     let stdout = '';
     let stderr = '';
@@ -500,7 +501,7 @@ function spawnFileTests(relPath, titles, project = 'vuhl-uat-chrome') {
     const timer = setTimeout(() => {
       proc.kill('SIGKILL');
       reject(new Error(`Test timed out after 10 minutes: ${relPath}`));
-    }, TIMEOUT_MS);
+    }, RUN_TIMEOUT_MS);
 
     proc.on('close', (code, signal) => {
       clearTimeout(timer);
@@ -528,7 +529,7 @@ function parsePlaywrightJson(json) {
         const r = spec.tests?.[0]?.results?.[0];
         results.push({
           title: spec.title,
-          describe: suite.title, // the suite that directly contains the spec is the describe block
+          describe: suite.title,
           status: r?.status || (spec.ok ? 'passed' : 'failed'),
           duration: r?.duration || 0,
           error: r?.errors?.[0]?.message || null,
@@ -541,35 +542,30 @@ function parsePlaywrightJson(json) {
   return results;
 }
 
-// ── Shared grouping helper ────────────────────────────────────────────────────
+// ── Slack message formatters ──────────────────────────────────────────────────
 
 function buildGroupedList(tests) {
   const groups = new Map();
   for (const t of tests) {
     const key = t.describe || '';
-    if (!groups.has(key)) groups.set(key, { isSerial: t.isSerial || false, titles: [] });
+    if (!groups.has(key)) groups.set(key, []);
     if (t.relPaths) {
-      if (t.relPaths.length > 1) {
-        groups.get(key).titles.push(...t.relPaths.map(r => r.display || r.title));
-      }
+      if (t.relPaths.length > 1) groups.get(key).push(...t.relPaths.map(r => r.display || r.title));
     } else if (t.isSerial) {
-      groups.get(key).titles.push(...t.titles);
+      groups.get(key).push(...t.titles);
     } else {
-      groups.get(key).titles.push(t.title);
+      groups.get(key).push(t.title);
     }
   }
   const lines = [];
-  for (const [describe, { titles }] of groups.entries()) {
+  for (const [describe, titles] of groups.entries()) {
     if (describe) lines.push(`*${describe}*`);
     for (const title of titles) lines.push(`• ${title}`);
   }
   return lines.join('\n');
 }
 
-// ── Format results for Slack ──────────────────────────────────────────────────
-
 function formatResults(results, elapsedMs, envLabel = 'UAT', selectedTests = []) {
-  // Map test title → group name for single-test predefined groups
   const singleTestGroups = new Map();
   for (const t of selectedTests) {
     if (t.relPaths && t.relPaths.length === 1) {
@@ -583,7 +579,6 @@ function formatResults(results, elapsedMs, envLabel = 'UAT', selectedTests = [])
 
   let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s · *${envLabel}*\n\n`;
 
-  // Group by describe block; single-test predefined groups get their own key
   const groups = new Map();
   for (const r of results) {
     const key = singleTestGroups.has(r.title)
@@ -595,19 +590,15 @@ function formatResults(results, elapsedMs, envLabel = 'UAT', selectedTests = [])
 
   for (const [key, groupResults] of groups.entries()) {
     const isSingleGroup = key.startsWith('__group__');
-    const describe = isSingleGroup ? null : key;
-    if (describe) text += `*${describe}*\n`;
+    if (!isSingleGroup && key) text += `*${key}*\n`;
     for (const r of groupResults) {
       const icon = r.status === 'passed' ? '✅' : '❌';
       const dur = (r.duration / 1000).toFixed(1);
-      if (isSingleGroup) {
-        text += `${icon}  *${key.slice(9)}* _(${dur}s)_\n`;
-      } else {
-        text += `${icon}  ${r.title} _(${dur}s)_\n`;
-      }
+      text += isSingleGroup
+        ? `${icon}  *${key.slice(9)}* _(${dur}s)_\n`
+        : `${icon}  ${r.title} _(${dur}s)_\n`;
       if (r.error) {
-        const firstLine = r.error.split('\n')[0].substring(0, 120);
-        text += `      \`${firstLine}\`\n`;
+        text += `      \`${r.error.split('\n')[0].substring(0, 120)}\`\n`;
       }
     }
     text += '\n';
