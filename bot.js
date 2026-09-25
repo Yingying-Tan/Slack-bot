@@ -82,17 +82,11 @@ app.action('stop_tests', async ({ ack, body, client }) => {
   run.proc.kill('SIGTERM');
   activeRuns.delete(runId);
 
-  // Update running message to show stopped
   await client.chat.update({
     channel: run.channelId,
     ts: run.msgTs,
-    text: run.runningText + '\n🛑 *Stopped*',
+    text: `<@${run.userId}> 🛑 Test run was stopped.\n\n${run.runningText}`,
     blocks: [],
-  });
-
-  await client.chat.postMessage({
-    channel: run.channelId,
-    text: `<@${run.userId}> 🛑 Test run was stopped.`,
   });
 });
 
@@ -174,33 +168,21 @@ app.view('run_tests_modal', async ({ ack, view, body, client, logger }) => {
 
     const elapsed = Date.now() - startTime;
 
-    // Remove Stop button from running message
     await client.chat.update({
       channel: channelId,
       ts: runMsg.ts,
-      text: runningText,
+      text: `<@${userId}>\n${formatResults(results, elapsed, envLabel, selectedTests)}`,
       blocks: [],
-    });
-
-    await client.chat.postMessage({
-      channel: channelId,
-      text: `<@${userId}>\n${formatResults(results, elapsed, envLabel)}`,
     });
   } catch (err) {
     activeRuns.delete(runId);
 
-    // Remove Stop button on error too
     await client.chat.update({
       channel: channelId,
       ts: runMsg.ts,
-      text: runningText,
+      text: `<@${userId}> ❌ Test run failed\n\`\`\`${String(err.message).substring(0, 500)}\`\`\``,
       blocks: [],
     }).catch(() => {});
-
-    await client.chat.postMessage({
-      channel: channelId,
-      text: `<@${userId}> ❌ Test run failed\n\`\`\`${String(err.message).substring(0, 500)}\`\`\``,
-    });
   }
 });
 
@@ -408,7 +390,7 @@ function buildModal(groups, channelId, testGroups = {}) {
     type: 'modal',
     callback_id: 'run_tests_modal',
     private_metadata: channelId,
-    title: { type: 'plain_text', text: 'Ping Test Runner' },
+    title: { type: 'plain_text', text: 'Playwright Test Runner' },
     submit: { type: 'plain_text', text: 'Run Selected' },
     close: { type: 'plain_text', text: 'Cancel' },
     blocks,
@@ -567,7 +549,9 @@ function buildGroupedList(tests) {
     const key = t.describe || '';
     if (!groups.has(key)) groups.set(key, { isSerial: t.isSerial || false, titles: [] });
     if (t.relPaths) {
-      groups.get(key).titles.push(...t.relPaths.map(r => r.display || r.title));
+      if (t.relPaths.length > 1) {
+        groups.get(key).titles.push(...t.relPaths.map(r => r.display || r.title));
+      }
     } else if (t.isSerial) {
       groups.get(key).titles.push(...t.titles);
     } else {
@@ -584,27 +568,43 @@ function buildGroupedList(tests) {
 
 // ── Format results for Slack ──────────────────────────────────────────────────
 
-function formatResults(results, elapsedMs, envLabel = 'UAT') {
+function formatResults(results, elapsedMs, envLabel = 'UAT', selectedTests = []) {
+  // Map test title → group name for single-test predefined groups
+  const singleTestGroups = new Map();
+  for (const t of selectedTests) {
+    if (t.relPaths && t.relPaths.length === 1) {
+      singleTestGroups.set(t.relPaths[0].title, t.describe);
+    }
+  }
+
   const passed = results.filter(r => r.status === 'passed').length;
   const failed = results.length - passed;
   const sec = (elapsedMs / 1000).toFixed(1);
 
   let text = `*Playwright Test Results* — ${results.length} test${results.length !== 1 ? 's' : ''} · ${sec}s · *${envLabel}*\n\n`;
 
-  // Group by describe block, preserving order of first appearance
+  // Group by describe block; single-test predefined groups get their own key
   const groups = new Map();
   for (const r of results) {
-    const key = r.describe || '';
+    const key = singleTestGroups.has(r.title)
+      ? `__group__${singleTestGroups.get(r.title)}`
+      : (r.describe || '');
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
 
-  for (const [describe, groupResults] of groups.entries()) {
+  for (const [key, groupResults] of groups.entries()) {
+    const isSingleGroup = key.startsWith('__group__');
+    const describe = isSingleGroup ? null : key;
     if (describe) text += `*${describe}*\n`;
     for (const r of groupResults) {
       const icon = r.status === 'passed' ? '✅' : '❌';
       const dur = (r.duration / 1000).toFixed(1);
-      text += `${icon}  ${r.title} _(${dur}s)_\n`;
+      if (isSingleGroup) {
+        text += `${icon}  *${key.slice(9)}* _(${dur}s)_\n`;
+      } else {
+        text += `${icon}  ${r.title} _(${dur}s)_\n`;
+      }
       if (r.error) {
         const firstLine = r.error.split('\n')[0].substring(0, 120);
         text += `      \`${firstLine}\`\n`;

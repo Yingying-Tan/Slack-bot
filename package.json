@@ -9,5 +9,8 @@
   "dependencies": {
     "@slack/bolt": "^3.17.0",
     "dotenv": "^16.4.0"
+  },
+  "overrides": {
+    "@slack/socket-mode": "^2.0.7"
   }
 }
